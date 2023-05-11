@@ -12,16 +12,23 @@ import (
 
 	"git.sr.ht/~spc/go-log"
 
+	"github.com/redhatinsights/yggdrasil/internal/sync"
 	"github.com/redhatinsights/yggdrasil/ipc"
 	"github.com/redhatinsights/yggdrasil/worker"
 )
 
 var sleepTime time.Duration
 
+// sycMapCancelChan is a map of channels that maps message ID and its current
+// work. This allows for the cancellation of a message that has not finished.
+var sycMapCancelChan sync.RWMutexMap[chan struct{}]
+
 // echo opens a new dbus connection and calls the
 // com.redhat.Yggdrasil1.Dispatcher1.Transmit method, returning the
 // metadata and data. New ID is generated for the message, and
 // response_to is set to the ID of the message we received.
+// Cancelled messages will only be handled if the worker is running
+// in the slow mode.
 func echo(
 	w *worker.Worker,
 	addr string,
@@ -36,8 +43,23 @@ func echo(
 
 	// Sleep time between receiving the message and sending it
 	if sleepTime > 0 {
-		log.Infof("sleeping: %v", sleepTime)
+		// Setting the channel to handle cancellation
+		sycMapCancelChan.Set(rcvId, make(chan struct{}))
+
+		log.Tracef("sleeping: %v", sleepTime)
 		time.Sleep(sleepTime)
+
+		// Cancel message if it has been sent a cancel message
+		// during sleep time
+		cancelChan, _ := sycMapCancelChan.Get(rcvId)
+		select {
+		case <-cancelChan:
+			log.Tracef("canceled echo message id: %v", rcvId)
+			sycMapCancelChan.Del(rcvId)
+			return nil
+		default:
+			sycMapCancelChan.Del(rcvId)
+		}
 	}
 
 	// Set "response_to" according to the rcvId of the message we received
@@ -63,6 +85,17 @@ func echo(
 
 	if err := w.SetFeature("DispatchedAt", time.Now().Format(time.RFC3339)); err != nil {
 		return fmt.Errorf("cannot set feature: %w", err)
+	}
+
+	return nil
+}
+
+// cancelEcho receives a cancel message id via  com.redhat.Yggdrasil1.Worker1.C.ancel method
+// closes the channel associated to that message to cancel its current run
+func cancelEcho(w *worker.Worker, addr string, id string, cancelID string) error {
+	log.Infof("cancelling message with id %v", cancelID)
+	if cancelChan, exists := sycMapCancelChan.Get(cancelID); exists {
+		close(cancelChan)
 	}
 
 	return nil
@@ -96,6 +129,7 @@ func main() {
 		"echo",
 		remoteContent,
 		map[string]string{"DispatchedAt": "", "Version": "1"},
+		cancelEcho,
 		echo,
 		events,
 	)

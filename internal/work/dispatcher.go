@@ -340,3 +340,29 @@ func (d *Dispatcher) senderName(sender dbus.Sender) (string, error) {
 
 	return "", fmt.Errorf("cannot get name for sender: %v", sender)
 }
+
+// CancelMessage implements the dispatching of a cancel message to the worker.
+func (d *Dispatcher) CancelMessage(command yggdrasil.Command, id string) error {
+	// Send the message through the cancel interface
+	directive, exists := command.Arguments["directive"]
+	if !exists {
+		return fmt.Errorf("cancel command does not contain 'directive' argument")
+	}
+	messageID, exists := command.Arguments["messageID"]
+	if !exists {
+		return fmt.Errorf("cancel command does not contain 'messageID' argument")
+	}
+
+	obj := d.conn.Object("com.redhat.Yggdrasil1.Worker1."+directive,
+		dbus.ObjectPath(filepath.Join("/com/redhat/Yggdrasil1/Worker1/", directive)))
+	call := obj.Call("com.redhat.Yggdrasil1.Worker1.Cancel", 0,
+		directive,
+		id,
+		messageID)
+	if err := call.Store(); err != nil {
+		return fmt.Errorf("cannot call Cancel method with message %v on worker: %v", messageID, err)
+	}
+	log.Debugf("sent cancel message %v to worker %v", messageID, directive)
+	d.Dispatchers <- d.FlattenDispatchers()
+	return nil
+}

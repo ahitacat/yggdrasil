@@ -16,6 +16,10 @@ import (
 // RxFunc is a function type that gets called each time the worker receives data.
 type RxFunc func(w *Worker, addr string, id string, responseTo string, metadata map[string]string, data []byte) error
 
+// CancelRxFunc is a function type that gets called each time the worker receives
+// a cancel message
+type CancelRxFunc func(w *Worker, addr string, id string, cancelID string) error
+
 // EventHandlerFunc is a function type that gets called each time the worker
 // receives a com.redhat.Yggdrasil1.Dispatcher1.Event signal.
 type EventHandlerFunc func(e ipc.DispatcherEvent)
@@ -26,6 +30,7 @@ type Worker struct {
 	features      map[string]string
 	remoteContent bool
 	rx            RxFunc
+	cancelRx      CancelRxFunc
 	conn          *dbus.Conn
 	objectPath    dbus.ObjectPath
 	busName       string
@@ -33,7 +38,7 @@ type Worker struct {
 }
 
 // NewWorker creates a new worker.
-func NewWorker(directive string, remoteContent bool, features map[string]string, rx RxFunc, events EventHandlerFunc) (*Worker, error) {
+func NewWorker(directive string, remoteContent bool, features map[string]string, cancel CancelRxFunc, rx RxFunc, events EventHandlerFunc) (*Worker, error) {
 	r := regexp.MustCompile("-")
 	if r.Match([]byte(directive)) {
 		return nil, fmt.Errorf("invalid directive '%v'", directive)
@@ -43,6 +48,7 @@ func NewWorker(directive string, remoteContent bool, features map[string]string,
 		directive:     directive,
 		features:      features,
 		remoteContent: remoteContent,
+		cancelRx:      cancel,
 		rx:            rx,
 		objectPath:    dbus.ObjectPath(path.Join("/com/redhat/Yggdrasil1/Worker1", directive)),
 		busName:       fmt.Sprintf("com.redhat.Yggdrasil1.Worker1.%v", directive),
@@ -95,7 +101,7 @@ func (w *Worker) Connect(quit <-chan os.Signal) error {
 	// Export worker onto the bus, implementing the com.redhat.Yggdrasil1.Worker1
 	// and org.freedesktop.DBus.Introspectable interfaces. The path name the
 	// worker exports includes the directive name.
-	if err := w.conn.ExportMethodTable(map[string]interface{}{"Dispatch": w.dispatch}, w.objectPath, "com.redhat.Yggdrasil1.Worker1"); err != nil {
+	if err := w.conn.ExportMethodTable(map[string]interface{}{"Dispatch": w.dispatch, "Cancel": w.cancel}, w.objectPath, "com.redhat.Yggdrasil1.Worker1"); err != nil {
 		return fmt.Errorf("cannot export com.redhat.Yggdrasil1.Worker1 interface: %w", err)
 	}
 
@@ -166,6 +172,39 @@ func (w *Worker) EmitEvent(event ipc.WorkerEventName, messageID string, message 
 	}
 	log.Debugf("emitting event %v", event)
 	return w.conn.Emit(dbus.ObjectPath(path.Join("/com/redhat/Yggdrasil1/Worker1", w.directive)), "com.redhat.Yggdrasil1.Worker1.Event", args...)
+}
+
+// cancel implements com.redhat.Yggdrasil1.Worker1.Cancel method by calling the
+// worker's cancelRxFunc in a goroutine.
+func (w *Worker) cancel(addr string, id string, cancelID string) *dbus.Error {
+	// If worker doesn't implements the cancelation function it does nothing
+	if w.cancelRx == nil {
+		log.Debug("worker does not support cancellation messages")
+		return nil
+	}
+
+	log.Tracef("cancelling message:")
+	log.Tracef("addr = %v", addr)
+	log.Tracef("id = %v", id)
+	log.Tracef("cancel-id = %v", cancelID)
+
+	// Communicate the worker accepts the message and its starting to
+	// work on it.
+	if err := w.EmitEvent(ipc.WorkerEventNameBegin, id, ""); err != nil {
+		return dbus.NewError("com.redhat.Yggdrasil1.Worker1.EventError", []interface{}{err.Error()})
+	}
+
+	go func() {
+		if err := w.cancelRx(w, addr, id, cancelID); err != nil {
+			log.Errorf("cannot call cancelRx: %v", err)
+		}
+		// Communicate to yggd client that the work has finished.
+		if err := w.EmitEvent(ipc.WorkerEventNameEnd, id, ""); err != nil {
+			log.Errorf("cannot emit event: %v", err)
+		}
+	}()
+
+	return nil
 }
 
 // dispatch implements com.redhat.Yggdrasil1.Worker1.Dispatch by calling the

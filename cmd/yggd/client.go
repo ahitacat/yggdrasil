@@ -299,6 +299,13 @@ func (c *Client) ReceiveControlMessage(msg *yggdrasil.Control) error {
 			if err := c.transporter.Connect(); err != nil {
 				return fmt.Errorf("cannot reconnect to broker: %w", err)
 			}
+		case yggdrasil.CommandNameCancel:
+			log.Info("cancelling message...")
+			// Dispatch to apropriated worker.
+			// cmd contains the directive and the message id to be canceled.
+			if err := c.dispatcher.CancelMessage(cmd, msg.MessageID); err != nil {
+				return fmt.Errorf("cannot dispatch cancel message: %w", err)
+			}
 		default:
 			return fmt.Errorf("unknown command: %v", cmd.Command)
 		}
